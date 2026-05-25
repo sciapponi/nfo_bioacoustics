@@ -250,7 +250,7 @@ class FilmSirenClassifier(nn.Module):
     def __init__(
         self,
         num_classes: int = 7,
-        modulator_out_dim: int = 64,
+        modulator_out_dim: int = 32,
         siren_hidden_dim: int = 128,
         num_siren_layers: int = 3,
         w0_first: float = 30.0,

@@ -113,6 +113,8 @@ class WhaleSoundsDataset(Dataset):
     WhaleSounds dataset from HuggingFace - loaded directly from .npy files.
     
     Bypasses the loading script by downloading raw numpy arrays directly.
+    Supports optional time masking augmentation to prevent overfitting to
+    specific temporal patterns in training data.
     """
     
     def __init__(
@@ -123,12 +125,16 @@ class WhaleSoundsDataset(Dataset):
         normalize: bool = True,
         cache_dir: Optional[str] = None,
         ignore_class_7: bool = True,
+        time_mask_prob: float = 0.3,
+        time_mask_width_range: Tuple[int, int] = (50, 200),
     ):
         self.split = split
         self.target_duration = target_duration
         self.target_sr = target_sr
         self.normalize = normalize
         self.target_samples = int(target_sr * target_duration)
+        self.time_mask_prob = time_mask_prob if split == "train" else 0.0
+        self.time_mask_width_range = time_mask_width_range
         
         print(f"Loading WhaleSounds {split} split directly from HuggingFace...")
         
@@ -232,6 +238,12 @@ class WhaleSoundsDataset(Dataset):
             if max_val > 0:
                 features = features / max_val
         
+        # Apply time masking augmentation (SpecAugment-style for temporal domain)
+        if self.time_mask_prob > 0.0 and np.random.random() < self.time_mask_prob:
+            mask_width = np.random.randint(self.time_mask_width_range[0], self.time_mask_width_range[1])
+            mask_start = np.random.randint(0, max(1, len(features) - mask_width))
+            features[mask_start:mask_start + mask_width] = 0.0
+        
         features_tensor = torch.from_numpy(features.astype(np.float32))
         if features_tensor.dim() == 1:
             features_tensor = features_tensor.unsqueeze(0)
@@ -268,9 +280,17 @@ def get_whale_dataloader(
     use_synthetic: bool = False,
     cache_dir: Optional[str] = None,
     ignore_class_7: bool = True,
+    time_mask_prob: float = 0.3,
+    time_mask_width_range: Tuple[int, int] = (50, 200),
 ) -> Tuple[DataLoader, Dataset]:
     """
     Create DataLoader for WhaleSounds dataset with fallback to synthetic data.
+    
+    Args:
+        split: "train" or "validation"
+        batch_size: Number of samples per batch
+        time_mask_prob: Probability of applying time masking augmentation (train split only)
+        time_mask_width_range: (min_width, max_width) in samples for random masking window
     """
     if use_synthetic:
         print("Using synthetic whale dataset")
@@ -289,7 +309,9 @@ def get_whale_dataloader(
                 target_duration=target_duration,
                 target_sr=target_sr,
                 cache_dir=cache_dir,
-                ignore_class_7=ignore_class_7
+                ignore_class_7=ignore_class_7,
+                time_mask_prob=time_mask_prob,
+                time_mask_width_range=time_mask_width_range,
             )
         except Exception as e:
             print(f"Warning: Could not load real WhaleSounds dataset: {e}")

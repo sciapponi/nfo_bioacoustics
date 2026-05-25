@@ -285,6 +285,8 @@ def main():
         target_duration=cfg.data.target_duration,
         target_sr=cfg.data.target_sr,
         shuffle=cfg.data.shuffle_train,
+        time_mask_prob=0.3,  # 30% chance of time masking per sample
+        time_mask_width_range=(50, 200),  # 50-200 sample window (5-20ms @ 250Hz target_sr)
     )
     
     val_loader, val_dataset = get_whale_dataloader(
@@ -294,6 +296,7 @@ def main():
         target_duration=cfg.data.target_duration,
         target_sr=cfg.data.target_sr,
         shuffle=False,
+        time_mask_prob=0.0,  # No augmentation for validation
     )
     
     print(f"Train samples: {len(train_dataset)}")
@@ -357,20 +360,34 @@ def main():
     weight_decay = getattr(cfg.training, 'weight_decay', 0.0)
     base_lr = cfg.training.learning_rate
     
-    # For FiLM-SIREN, use lower modulator LR to stabilize training
+    # For FiLM-SIREN, use lower modulator LR + selective weight decay (SIREN-safe)
     if args.model_type == "film_siren":
-        modulator_params = model.modulator.parameters()
-        other_params = [p for name, p in model.named_parameters() if not name.startswith('modulator')]
+        modulator_params = list(model.modulator.parameters())
+        classifier_params = list(model.classifier.parameters())
+        siren_params = [p for name, p in model.named_parameters() 
+                       if name.startswith('siren_') or name.startswith('pe.')]
+        
         modulator_lr = base_lr * 0.1  # 10x lower LR for modulator
+        
+        # Apply strict weight decay ONLY to modulator + classifier (standard NNs)
+        # Keep SIREN layers completely decay-free to preserve sinusoidal initialization
+        modulator_wd = 1e-2  # 0.01 - strict regularization
+        siren_wd = 0.0       # Zero decay - protect SIREN initialization
+        
         param_groups = [
-            {'params': modulator_params, 'lr': modulator_lr},
-            {'params': other_params, 'lr': base_lr}
+            {'params': modulator_params, 'lr': modulator_lr, 'weight_decay': modulator_wd},
+            {'params': classifier_params, 'lr': base_lr, 'weight_decay': modulator_wd},
+            {'params': siren_params, 'lr': base_lr, 'weight_decay': siren_wd}
         ]
-        print(f"Using separate LRs: modulator={modulator_lr:.2e}, siren={base_lr:.2e}")
+        print(f"Using separate LRs + selective weight decay:")
+        print(f"  Modulator: lr={modulator_lr:.2e}, wd={modulator_wd:.2e}")
+        print(f"  Classifier: lr={base_lr:.2e}, wd={modulator_wd:.2e}")
+        print(f"  SIREN: lr={base_lr:.2e}, wd={siren_wd} (protected)")
+        
         if opt_name == 'adam':
-            optimizer = optim.Adam(param_groups, weight_decay=weight_decay)
+            optimizer = optim.Adam(param_groups)
         else:
-            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+            optimizer = optim.AdamW(param_groups)
     else:
         if opt_name == 'adam':
             optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
