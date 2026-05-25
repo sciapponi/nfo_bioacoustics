@@ -3,7 +3,8 @@
 from .fno import FNOStack
 from .fno2d import FNO2DLayer, FNO2DStack
 from .conformer import TinyCNN
-from .spectrogram_model import SpectrogramModel, FNOConformer2D, EfficientNetSpectrogram, SpectrogramModelConv
+from .spectrogram_model import SpectrogramModel, FNOConformer2D, EfficientNetSpectrogram, SpectrogramModelConv, SpectrogramFNOTime
+from .siren import SirenConvClassifier, FilmSirenClassifier
 
 # Aliases for backward compatibility
 TinyConformer = TinyCNN
@@ -21,4 +22,7 @@ __all__ = [
     "SpectrogramModelConv",
     "SpectrogramFNOTime",
     "EfficientNetSpectrogram",
+    # SIREN models
+    "SirenConvClassifier",
+    "FilmSirenClassifier",
 ]

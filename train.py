@@ -11,6 +11,7 @@ Usage:
 import os
 import sys
 import argparse
+from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -35,6 +36,7 @@ def set_seed(seed: int):
 
 def create_model(cfg: ExperimentConfig, num_classes: int) -> TinyConformer:
     """Create model from config."""
+    # Default conformer model
     return TinyConformer(
         num_classes=num_classes,  # Use adjusted class count
         fno_in_channels=cfg.fno.in_channels,
@@ -57,6 +59,7 @@ def train_epoch(
     device: str,
     ignore_undefined: bool = False,
     log_interval: int = 50,
+    mixup_alpha: float = 0.0,
 ) -> tuple:
     """Train for one epoch."""
     model.train()
@@ -79,10 +82,17 @@ def train_epoch(
             labels = labels[mask]
             sample_rates = sample_rates[mask]
         
-        # Forward pass
+        # Forward pass (with optional mixup)
         optimizer.zero_grad()
-        logits = model(audio, sample_rate=sample_rates[0].item())  # Use first rate in batch
-        loss = criterion(logits, labels)
+        if mixup_alpha and mixup_alpha > 0.0 and audio.size(0) > 1:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+            perm = torch.randperm(audio.size(0))
+            audio_mixed = lam * audio + (1 - lam) * audio[perm]
+            logits = model(audio_mixed, sample_rate=sample_rates[0].item())
+            loss = lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels[perm])
+        else:
+            logits = model(audio, sample_rate=sample_rates[0].item())  # Use first rate in batch
+            loss = criterion(logits, labels)
         
         # Backward pass
         loss.backward()
@@ -196,6 +206,19 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--model-type", type=str, default="conformer", choices=["conformer", "siren_conv", "film_siren"], help="Model architecture to train")
+    # Siren / model sizing
+    parser.add_argument("--siren-feat-dim", type=int, default=None, help="Feature dim for Siren encoder")
+    parser.add_argument("--siren-blocks", type=int, default=None, help="Number of SIREN blocks in encoder")
+    parser.add_argument("--conv-blocks", type=int, default=None, help="Number of conv blocks in Siren classifier")
+    parser.add_argument("--conv-channels", type=int, default=None, help="Conv channels for Siren classifier (overrides config)")
+    # Optimizer / training recipe
+    parser.add_argument("--optimizer", type=str, default=None, choices=["adam", "adamw"], help="Optimizer")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Weight decay for optimizer")
+    parser.add_argument("--mixup", type=float, default=0.0, help="Mixup alpha (0 to disable)")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for CrossEntropyLoss")
+    parser.add_argument("--lr-scheduler", type=str, default=None, choices=["cosine", "none"], help="Learning rate scheduler")
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="Linear warmup epochs before LR schedule")
     args = parser.parse_args()
     
     # Load config
@@ -214,6 +237,31 @@ def main():
         cfg.training.checkpoint_dir = args.checkpoint_dir
     if args.seed:
         cfg.training.seed = args.seed
+    # CLI overrides for siren/model sizing and training recipe
+    if args.siren_feat_dim:
+        cfg.siren = getattr(cfg, 'siren', None) or SimpleNamespace()
+        cfg.siren.feat_dim = args.siren_feat_dim
+    if args.siren_blocks:
+        cfg.siren = getattr(cfg, 'siren', None) or SimpleNamespace()
+        cfg.siren.num_blocks = args.siren_blocks
+    if args.conv_blocks:
+        cfg.siren = getattr(cfg, 'siren', None) or SimpleNamespace()
+        cfg.siren.conv_blocks = args.conv_blocks
+    if args.conv_channels:
+        cfg.siren = getattr(cfg, 'siren', None) or SimpleNamespace()
+        cfg.siren.conv_channels = args.conv_channels
+    if args.optimizer:
+        cfg.training.optimizer = args.optimizer
+    if args.weight_decay is not None:
+        cfg.training.weight_decay = args.weight_decay
+    if args.mixup is not None:
+        cfg.training.mixup = args.mixup
+    if args.label_smoothing is not None:
+        cfg.training.label_smoothing = args.label_smoothing
+    if args.lr_scheduler is not None:
+        cfg.training.lr_scheduler = args.lr_scheduler
+    if args.warmup_epochs is not None:
+        cfg.training.warmup_epochs = args.warmup_epochs
     
     # Set device
     device = cfg.training.device
@@ -250,7 +298,7 @@ def main():
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
-    print(f"Total dataset classes: {cfg.num_classes}")
+    print(f"Raw WhaleSounds labels: {cfg.num_classes} (7 active classes after filtering class 7)")
     
     # Print distributions before any dynamic filtering
     print_class_distribution(train_dataset, "Train Set", cfg.num_classes)
@@ -260,12 +308,43 @@ def main():
     # If ignoring 7, network only outputs predictions up to class 6 (7 distinct classes: 0 to 6)
     num_active_classes = cfg.num_classes - 1 if IGNORE_UNDEFINED else cfg.num_classes
     if IGNORE_UNDEFINED:
-        print(f"\n[INFO] IGNORE_UNDEFINED is active. Class 7 will be stripped from training batches.")
-        print(f"       Model will output dimensions for {num_active_classes} classes (0 through 6).")
+        print(f"\n[INFO] IGNORE_UNDEFINED is active. Class 7 ('Unidentified') will be stripped from training batches.")
+        print(f"       Model will output dimensions for {num_active_classes} active classes (0 through 6).")
     
     # Create model
     print("\nCreating model...")
-    model = create_model(cfg, num_classes=num_active_classes).to(device)
+    model = create_model(cfg, num_classes=num_active_classes)
+    # If user requested a different model type, override here
+    if args.model_type == "siren_conv":
+        from models.siren import SirenConvClassifier
+        siren_cfg = getattr(cfg, 'siren', None)
+        feat_dim = getattr(siren_cfg, 'feat_dim', cfg.fno.out_channels)
+        conv_blocks = getattr(siren_cfg, 'conv_blocks', 2)
+        siren_num_layers = getattr(siren_cfg, 'num_blocks', 3)
+        conv_channels = getattr(siren_cfg, 'conv_channels', cfg.conformer.channels)
+        model = SirenConvClassifier(
+            num_classes=num_active_classes,
+            feat_dim=feat_dim,
+            conv_channels=conv_channels,
+            conv_blocks=conv_blocks,
+            siren_num_layers=siren_num_layers,
+            kernel_size=5,
+        )
+    elif args.model_type == "film_siren":
+        from models.siren import FilmSirenClassifier
+        siren_cfg = getattr(cfg, 'siren', None)
+        modulator_out_dim = getattr(siren_cfg, 'feat_dim', 64)
+        siren_hidden_dim = getattr(siren_cfg, 'conv_channels', 128)
+        num_siren_layers = getattr(siren_cfg, 'num_blocks', 3)
+        model = FilmSirenClassifier(
+            num_classes=num_active_classes,
+            modulator_out_dim=modulator_out_dim,
+            siren_hidden_dim=siren_hidden_dim,
+            num_siren_layers=num_siren_layers,
+            w0_first=30.0,
+            w0_hidden=1.0,
+        )
+    model = model.to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -273,21 +352,52 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Create optimizer and loss
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.weight_decay,
-    )
+    # Create optimizer (support Adam/AdamW) and loss (with optional label smoothing)
+    opt_name = getattr(cfg.training, 'optimizer', 'adamw')
+    weight_decay = getattr(cfg.training, 'weight_decay', 0.0)
+    base_lr = cfg.training.learning_rate
     
-    criterion = nn.CrossEntropyLoss()
-    
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=cfg.training.num_epochs,
-        eta_min=1e-6,
-    )
+    # For FiLM-SIREN, use lower modulator LR to stabilize training
+    if args.model_type == "film_siren":
+        modulator_params = model.modulator.parameters()
+        other_params = [p for name, p in model.named_parameters() if not name.startswith('modulator')]
+        modulator_lr = base_lr * 0.1  # 10x lower LR for modulator
+        param_groups = [
+            {'params': modulator_params, 'lr': modulator_lr},
+            {'params': other_params, 'lr': base_lr}
+        ]
+        print(f"Using separate LRs: modulator={modulator_lr:.2e}, siren={base_lr:.2e}")
+        if opt_name == 'adam':
+            optimizer = optim.Adam(param_groups, weight_decay=weight_decay)
+        else:
+            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+    else:
+        if opt_name == 'adam':
+            optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+        else:
+            optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    label_smoothing = getattr(cfg.training, 'label_smoothing', 0.0)
+    try:
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    except TypeError:
+        # Older PyTorch may not support label_smoothing param
+        criterion = nn.CrossEntropyLoss()
+
+    # LR scheduling: support cosine with optional linear warmup (we'll compute lrs manually)
+    lr_scheduler_type = getattr(cfg.training, 'lr_scheduler', 'cosine')
+    warmup_epochs = getattr(cfg.training, 'warmup_epochs', 0)
+    T = cfg.training.num_epochs
+
+    def compute_lr_for_epoch(ep: int):
+        if warmup_epochs > 0 and ep < warmup_epochs:
+            return base_lr * float(ep + 1) / float(max(1, warmup_epochs))
+        if lr_scheduler_type == 'cosine':
+            # cosine decay after warmup
+            e = max(0, ep - warmup_epochs)
+            T_cos = max(1, T - warmup_epochs)
+            return 1e-6 + 0.5 * (base_lr - 1e-6) * (1 + np.cos(np.pi * e / T_cos))
+        return base_lr
     
     # Optional: Load checkpoint state
     start_epoch = 0
@@ -304,7 +414,8 @@ def main():
             best_val_acc = checkpoint.get("val_acc", 0.0)
             
             for _ in range(start_epoch):
-                scheduler.step()
+                # advance manual lr schedule pointer (no-op here, we set lr below)
+                pass
                 
             print(f"Loaded checkpoint successfully. Resuming from epoch {start_epoch}")
         else:
@@ -321,6 +432,20 @@ def main():
     best_epoch = start_epoch - 1 if start_epoch > 0 else 0
     
     for epoch in range(start_epoch, cfg.training.num_epochs):
+        # Set learning rate for this epoch (supports warmup + cosine)
+        lr = compute_lr_for_epoch(epoch)
+        
+        # For film_siren, keep modulator at 10% of SIREN LR
+        if args.model_type == "film_siren":
+            for i, g in enumerate(optimizer.param_groups):
+                if i == 0:  # modulator group
+                    g['lr'] = lr * 0.1
+                else:  # siren/other groups
+                    g['lr'] = lr
+        else:
+            for g in optimizer.param_groups:
+                g['lr'] = lr
+        
         # Train
         train_loss, train_acc = train_epoch(
             model,
@@ -330,6 +455,7 @@ def main():
             device,
             ignore_undefined=IGNORE_UNDEFINED,
             log_interval=cfg.training.log_interval,
+            mixup_alpha=getattr(cfg.training, 'mixup', 0.0),
         )
         
         # Evaluate
@@ -344,8 +470,7 @@ def main():
         else:
             val_loss, val_acc = 0.0, 0.0
         
-        # Learning rate step
-        scheduler.step()
+        # Learning rate step is handled manually by compute_lr_for_epoch
         
         # Logging
         print(

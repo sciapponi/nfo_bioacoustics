@@ -102,7 +102,7 @@ class ExperimentConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     
     # Derived
-    num_classes: int = 11  # WhaleSounds has 8 classes (7 + unidentified)
+    num_classes: int = 8  # WhaleSounds has 8 raw labels total (7 whale classes + unidentified)
 
 
 def get_default_config() -> ExperimentConfig:
