@@ -233,10 +233,17 @@ class WhaleSoundsDataset(Dataset):
             indices = np.linspace(0, len(features) - 1, self.target_samples)
             features = np.interp(indices, np.arange(len(features)), features)
         
+        # CRITICAL: Z-score normalization per file to handle dynamic range variation
+        # Different hydrophones record at different absolute levels; this forces each
+        # sample to have mean=0, std=1, highlighting relative vocal patterns over absolute scale
+        mean_val = np.mean(features)
+        std_val = np.std(features)
+        if std_val > 1e-8:  # Avoid division by very small values
+            features = (features - mean_val) / (std_val + 1e-8)
+        
         if self.normalize:
-            max_val = np.max(np.abs(features))
-            if max_val > 0:
-                features = features / max_val
+            # Clamp to [-3, 3] range after z-score to prevent extreme outliers
+            features = np.clip(features, -3.0, 3.0)
         
         # Apply time masking augmentation (SpecAugment-style for temporal domain)
         if self.time_mask_prob > 0.0 and np.random.random() < self.time_mask_prob:

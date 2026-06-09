@@ -131,16 +131,25 @@ class SirenConvClassifier(nn.Module):
 class Modulator(nn.Module):
     """Lightweight 1D-CNN encoder that extracts condition vectors from raw audio.
     
+    CRITICAL: First layer uses massive kernel (65 or 129 samples) to natively 
+    contextualize ultra-low frequency baleen whale calls (10-40 Hz).
+    At 250 Hz target_sr, a 65-sample kernel spans 260ms, capturing full cycles
+    of infrasonic sweeps. Subsequent layers remain small to capture combinations.
+    
     Output is fixed-size via Adaptive Average Pooling, making it sample-rate invariant.
     """
     
-    def __init__(self, out_dim: int = 64, hidden_channels: int = 32):
+    def __init__(self, out_dim: int = 32, hidden_channels: int = 32):
         super().__init__()
         layers = []
-        # 3-layer lightweight CNN
-        layers.append(nn.Conv1d(1, hidden_channels, kernel_size=3, padding=1))
+        
+        # MASSIVE first kernel to capture low-frequency whale sweeps
+        # kernel_size=65 at 250Hz = 260ms window → sees full cycles of 15Hz calls
+        # padding=32 preserves sequence length for subsequent layers
+        layers.append(nn.Conv1d(1, hidden_channels, kernel_size=65, padding=32))
         layers.append(nn.GELU())
         
+        # Subsequent layers remain small to efficiently combine features
         layers.append(nn.Conv1d(hidden_channels, hidden_channels * 2, kernel_size=3, padding=1))
         layers.append(nn.GELU())
         
@@ -251,11 +260,11 @@ class FilmSirenClassifier(nn.Module):
         self,
         num_classes: int = 7,
         modulator_out_dim: int = 32,
-        siren_hidden_dim: int = 128,
+        siren_hidden_dim: int = 256,
         num_siren_layers: int = 3,
         w0_first: float = 30.0,
         w0_hidden: float = 1.0,
-        num_pe_freqs: int = 6,
+        num_pe_freqs: int = 12,
     ):
         super().__init__()
         self.modulator = Modulator(out_dim=modulator_out_dim)
@@ -273,8 +282,21 @@ class FilmSirenClassifier(nn.Module):
             for _ in range(num_siren_layers - 1)
         ])
         
-        # Classifier head: Better design for noisy bioacoustic data
-        # Dual pooling creates 2*siren_hidden_dim features (mean + max)
+        # Time-compressing block: Gradually stride down temporal dimension while preserving
+        # local acoustic structure. Instead of global pooling all T timesteps, we compress
+        # the timeline via strided convolutions, allowing selective temporal focus.
+        self.time_compressor = nn.Sequential(
+            # Input: (B, siren_hidden_dim, T) where T=1000 samples
+            # First stride: compress by 8x (1000 → 125 timesteps)
+            nn.Conv1d(siren_hidden_dim, siren_hidden_dim, kernel_size=17, stride=8, padding=8),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            # Second stride: compress by 4x (125 → 31 timesteps)
+            nn.Conv1d(siren_hidden_dim, siren_hidden_dim, kernel_size=9, stride=4, padding=4),
+            nn.GELU()
+        )
+        
+        # Classifier head: Receives dual-pooled compressed features
         self.classifier = nn.Sequential(
             nn.Linear(siren_hidden_dim * 2, siren_hidden_dim),
             nn.GELU(),
@@ -297,7 +319,7 @@ class FilmSirenClassifier(nn.Module):
         
         B, _, T = x.shape
         
-        # 1. Extract global modulation context from raw audio
+        # 1. Extract global modulation context from raw audio (massive kernel captures low freqs)
         mod = self.modulator(x)  # (B, modulator_out_dim)
         
         # 2. Prepare Continuous Coordinate Input with Positional Encoding
@@ -318,11 +340,20 @@ class FilmSirenClassifier(nn.Module):
         for siren_layer in self.siren_hidden:
             h = siren_layer(h, mod)  # (B, T, siren_hidden_dim)
         
-        # 4. Dual Pooling: Mean captures overall structure, Max captures transients
-        h_mean = h.mean(dim=1)  # (B, siren_hidden_dim)
-        h_max = h.max(dim=1)[0]  # (B, siren_hidden_dim)
+        # 4. Temporal Compression via Strided Convolutions
+        # Transpose from (B, T, siren_hidden_dim) to (B, siren_hidden_dim, T) for conv ops
+        h_trans = h.transpose(1, 2)  # (B, siren_hidden_dim, T)
+        
+        # Apply strided time compressor to gradually reduce temporal dimension
+        # while preserving local acoustic structure (no information loss via global pooling)
+        h_compressed = self.time_compressor(h_trans)  # (B, siren_hidden_dim, T_compressed)
+        
+        # 5. Dual Pooling on Compressed Timeline
+        # Mean captures overall structure, Max captures transient peaks
+        h_mean = h_compressed.mean(dim=-1)  # (B, siren_hidden_dim)
+        h_max = h_compressed.max(dim=-1)[0]  # (B, siren_hidden_dim)
         h_pool = torch.cat([h_mean, h_max], dim=-1)  # (B, 2*siren_hidden_dim)
         
-        # 5. Classification with improved head
+        # 6. Classification with improved head
         logits = self.classifier(h_pool)  # (B, num_classes)
         return logits
