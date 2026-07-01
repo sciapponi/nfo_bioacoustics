@@ -1,0 +1,6 @@
+logs/
+
+data/__pycache__/
+data/dataset_summary/
+
+data/individual
